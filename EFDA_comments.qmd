@@ -1,0 +1,202 @@
+---
+title: "Exploratory functional data analysis via PCA"
+author:
+- name: Rob J Hyndman
+  affiliations:
+    - department: Department of Econometrics & Business Statistics
+      name: Monash University
+      city: Clayton VIC
+      country: Australia
+      postal-code: 3800
+  email: Rob.Hyndman@monash.edu
+  orcid: 0000-0002-2140-5352
+bibliography: references.bib
+branding: false
+linestretch: 1.3
+format:
+  memo-pdf:
+    keep-tex: true
+    fig-width: 8
+    fig-height: 4.5
+    out-width: 100%
+execute:
+  echo: false
+  cache: true
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(weird)
+library(fdaoutlier)
+library(tsibble)
+library(patchwork)
+options(
+  ggplot2.discrete.colour = c("#D55E00", "#0072B2","#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442"),
+  ggplot2.discrete.fill = c("#D55E00", "#0072B2","#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442")
+)
+```
+
+```{r}
+#| label: usa
+usa <- vital::read_hmd_files("Mx_1x1.txt") |>
+  filter(Sex == "Total") |>
+  filter(Age <= 100) |>
+  as_tibble() |>
+  select(Year, Age, Mortality)
+usa_diff <- usa |>
+  as_tsibble(index = Year, key = Age) |>
+  group_by(Age) |>
+  mutate(diff_mx = difference(log(Mortality))) |>
+  ungroup() |>
+  as_tibble() |>
+  filter(!is.na(diff_mx))
+```
+
+@efda have produced a fascinating paper on the tools that are available for exploratory analysis of functional data. Much of the literature has focused on statistical models for functional data, and related theory, so it is great to see the important pre-modelling work receiving some attention.
+
+Amongst the methods they describe, several use functional principal component decomposition [@RD91] to transform the functional data into a lower-dimensional space. Then some standard EDA tools are applied to the first few principal component scores, and the results translated back into the original functional space. For example, this was the approach used in the functional bagplot and functional HDR boxplot proposed in @HS10. While there is no guarantee that the features of interest that are present in the original functional data will be preserved in the PCA space, in practice this almost always leads to useful results. As well as providing some helpful visualization tools, this approach can also be used for anomaly detection, giving an alternative approach to those methods based on statistical depth that are discussed by @efda.
+
+@fig-us-mortality (left) shows US mortality rates between 1933 and 2022, obtained from the @HMD. Each line denotes the mortality rates as a function of age for one year, with the colors in rainbow order corresponding to the years of observation. Overall, we see a large decrease in mortality rates during early childhood years, then an increase during teenage years. After about age 30, the rates increase almost linearly on a log scale. Comparing the curves over time, we see that the rates have steadily fallen for all ages up to about 95 years, with more than a 10-fold reduction in mortality rates at around age 10.
+
+```{r}
+#| label: fig-us-mortality
+#| dependson: setup
+#| fig-pos: "!htb"
+#| fig-width: 8
+#| fig-height: 4
+#| fig-cap: "Left: US age-specific mortality rates for 1933--2022. Right: Annual differences in log mortality rates."
+p1 <- usa |>
+  ggplot() +
+  aes(x = Age, y = log10(Mortality), color = Year, group = Year) +
+  geom_line() +
+  scale_color_gradientn(colors = rainbow(100)[1:80]) +
+  labs(y = "Log (base 10) mortality rate") +
+  scale_y_continuous(
+    sec.axis = sec_axis(~ 10^(.),
+      breaks = 10^(-(0:4)),
+      labels = format(10^(-(0:4)), scientific = FALSE),
+      name = "Mortality rate"
+    )
+  )
+p2 <- usa_diff |>
+  ggplot() +
+  aes(x = Age, y = diff_mx, color = Year, group = Year) +
+  geom_line() +
+  scale_color_gradientn(colors = rainbow(100)[1:80]) +
+  labs(y = "Change in log mortality")
+(p1 | p2) + plot_layout(guides = "collect") &
+  theme(
+    legend.position='bottom',
+    legend.key.size = unit(1, "cm")
+  )
+```
+
+
+```{r}
+#| label: fig-pca-bases
+#| message: false
+# Wide version of log Mortality with ages on columns
+usa_wide <- usa_diff |>
+  select(-Mortality) |>
+  tidyr::pivot_wider(names_from = Age, values_from = diff_mx, names_prefix = "Age") |>
+  select(-Year)
+
+# Compute first two principal components
+pca <- pcaPP::PCAproj(usa_wide, k = 3, method = "qn")
+
+# Save principal component scores
+pca_scores <- as_tibble(pca$scores) |>
+  mutate(Year = sort(unique(usa$Year))[-1])
+
+# Dave principal component loadings
+pca_loadings <- as_tibble(as.data.frame(pca$loadings)[1:101,]) |>
+  mutate(Age = 0:100)
+
+#pca_loadings |>
+#  tidyr::pivot_longer(-Age, values_to= "Loading", names_to = "Component") |>
+#  ggplot(aes(x=Age, y=Loading, group=Component, color = Component)) +
+#  geom_line()
+```
+
+```{r}
+#| message: false
+#| label: fig-pca-scores
+#| fig-pos: "!htb"
+#| fig-width: 8
+#| fig-height: 8
+#| out-width: 79%
+#| fig-cap: Pairwise scatterplots of the first three principal component scores for the US age-specific log mortality annual differences.
+# Find outliers in the PC scores
+pca_no_year <- pca_scores |> select(-Year)
+pca_scores <- pca_scores |>
+  mutate(prob = lookout::lookout(pca_no_year, alpha = 0.1, fast = FALSE)$outlier_probability)
+outliers <- pca_scores |> filter(prob < .5)
+p1 <- pca_scores |>
+  ggplot(aes(x = Comp.1, y = Comp.2)) +
+  geom_point() +
+  geom_point(data = outliers, color = "red") +
+  ggrepel::geom_label_repel(data = outliers, aes(label = Year)) +
+  labs(x = "PC Score 1", y = "PC Score 2")
+p2 <- pca_scores |>
+  ggplot(aes(x = Comp.2, y = Comp.3)) +
+  geom_point() +
+  geom_point(data = outliers, color = "red") +
+  ggrepel::geom_label_repel(data = outliers, aes(label = Year)) +
+  labs(x = "PC Score 2", y = "PC Score 3")
+p3 <- pca_scores |>
+  ggplot(aes(x = Comp.1, y = Comp.3)) +
+  geom_point() +
+  geom_point(data = outliers, color = "red") +
+  ggrepel::geom_label_repel(data = outliers, aes(label = Year)) +
+  labs(x = "PC Score 1", y = "PC Score 3")
+
+p1 + p3 + p2 + patchwork::plot_layout(design = "1#\n23")
+```
+
+Clearly the data are non-stationary due to the steady decline over time, so we consider the differences in the log mortality rates over time, as shown in right panel. Now several functional observations stand out as having different behaviour from the others, including three (in purple) from the last few years of data.
+
+We will use principal component scores to detect anomalies in this data set. Because we are interested in anomaly detection, we do not want the principal component decomposition to be affected by the anomalies we are trying to detect. Consequently, we will use the robust principal component method proposed by @pprpca, applied to the annual differences in the log mortality rates (shown on the right of @fig-us-mortality), to obtain the first three principal component scores. These are shown in @fig-pca-scores. The loadings (not shown) suggest that the first PC corresponds to ages 0--40, the second PC increases with age after age 30, while the third PC contrasts children under 10 with people above age 25.
+
+The lookout anomaly detection algorithm [@lookout2021] has been applied to the first three PC scores. This estimates a multivariate kernel density estimate of the 3-dimensional data set, and fits a generalized Pareto distribution (GPD) to the top 10% of the most extreme "surprisal" values (equal to minus the log of the estimated density at each observation). Those points with probability less than 0.5 under the GPD are labelled in @fig-pca-scores (giving an effect false positive rate of 5%). The last three years of data (2020--2022) are identified as anomalies (probably due to COVID-19), along with 1936 (at the end of the Great Depression, @tapia2009life) and 1947 (due to rapid improvement in mortality after WW2). Note that all three principal component scores are needed to identify these anomalies. War deaths are excluded from the data set, as they took place outside the country, so the war years are not seen as anomalous.
+
+@fig-outliers shows the years identified as anomalous against the backdrop of all other years in the data set. While the last three years stand out from the rest of the data, the data for 1936 and 1947 are not so obviously anomalous from the data plot alone.
+
+```{r}
+#| label: fig-outliers
+#| fig-pos: "!htb"
+outliers <- usa_diff |>
+  filter(Year %in% c(1936,1947,2020:2022))
+usa_diff |>
+  ggplot() +
+  aes(x = Age, y = diff_mx, group = Year) +
+  geom_line(color = "#bbbbbb") +
+  geom_line(data = outliers, aes(colour = as.factor(Year))) +
+  labs(y = "Change in log mortality") +
+  guides(color=guide_legend(title="Anomalous years"))
+```
+
+```{r}
+#| label: dir_out
+#| include: false
+z <- fdaoutlier::dir_out(usa_wide)
+yrs <- sort(pca_scores$Year[z$var_outlyingness > 2])
+if(length(yrs) != 4L)
+  stop("Something has changed")
+```
+
+When the "directional outlyingness" method of @dai2019directional is applied to these data, only `r yrs[1]`, `r yrs[2]`, `r yrs[3]` and `r yrs[4]` are identified as anomalies. The increase in mortality at the end of the Great Depression is missed, although it is arguably more anomalous than 1947 (especially after age 70) which is identified.
+
+
+```{r}
+#| label: fig-msplot
+#| eval: false
+#| fig-cap: "Outliers using dir_out. The outliers are shown as '+' and correspond to years ???."
+junk <- fdaoutlier::msplot(usa_wide, show_legend = FALSE)
+```
+
+This general approach to exploratory functional data analysis, using the PCA space rather than the original functional data space, can be employed for many other standard data analysis tasks such as assessment of data quality, identifying trends and seasonality, change point detection, density estimation, feature engineering, and more. The advantage is that it allows immediate use of the vast array of multivariate data analysis tools that already exist, rather than having to develop new tools for functional data. It provides a familiar and computationally efficient set of tools that is complementary to those that work more directly in the functional data space.
+
+The code to reproduce the results in these comments is available at <https://github.com/robjhyndman/EFDA>.
+
+\newpage
